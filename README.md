@@ -1,30 +1,39 @@
 # Select2Explain
 
-Select2Explain 是一个面向 PC 场景的跨平台桌面应用，目标是在用户完成划词或选中一段描述后，结合当前上下文向 AI 发起解释请求，并在鼠标停留位置附近弹出临时窗口展示结果。
+Select2Explain 是一个常驻系统托盘的桌面小工具。用户在任意应用里用鼠标选中一段文字后，应用会自动抓取当前选区、当前窗口截图，并在必要时补充窗口全文，再把 AI 解释弹到鼠标右上方；点击任意其他位置后，浮窗自动隐藏。
 
-当前阶段已经完成首版工程骨架，包含 Tauri 宿主层、React 前端工作台、解释弹窗原型、配置页、历史页以及 Rust 命令接口占位实现。
+## 当前状态
 
-## 产品目标
+- Windows 主链路已落地：托盘常驻、自动监听、popup 浮窗、OpenAI 兼容 Provider、系统凭据存储、渐进式上下文 AI 管线。
+- 运行时新增本地设置与日志：监听开关、日志开关会落到本地 `settings.json`，调试信息会写入本地 `runtime.log`。
+- macOS 仍保留设计路径与部分旧实现，但本轮没有做运行级验证，也没有宣称与 Windows 等价。
+- 调试入口已加入主控制面板，可直接验证“选区探测”和“完整采集”。
 
-- 支持 macOS 和 Windows 桌面环境
-- 提供接近“划词取译”的轻量交互，但输出内容是 AI 语义解释而非传统词典释义
-- 尽可能理解当前上下文，而不是只解释孤立词语
-- 采用临时悬浮窗展示结果，减少用户在不同应用之间切换
-- 为后续引入 Prompt 模板、模型切换、历史记录和企业知识库扩展预留架构空间
+## 核心行为
+
+1. 应用启动后显示控制面板，同时在后台保持运行。
+2. 用户保存 Provider 配置与 API Key，并开启“自动监听”。
+2.1 如需排查问题，可同时开启“本地调试日志”。
+3. 后端检测到新的选区签名时，先采集选中文本和当前窗口截图。
+4. AI 先基于“选中文本 + 截图”判断上下文是否足够；不足时再补发窗口全文。
+5. popup 在鼠标右上方显示解释；失焦后自动隐藏。
+6. 主窗口关闭时不会退出程序，可通过托盘菜单重新打开。
 
 ## 文档索引
 
 - [产品规划](./docs/product-plan.md)
 - [技术架构](./docs/technical-architecture.md)
-- [实施路线图](./docs/roadmap.md)
+- [测试清单](./docs/testing-checklist.md)
+- [用户指南](./docs/user-guide.md)
+- [开发者文档](./docs/developer.md)
 
-## 当前开发状态
+## 技术栈
 
-- 已初始化 `Tauri 2 + Rust + React + TypeScript` 项目结构
-- 已提供主工作台界面，可输入选中文本与上下文并触发解释预览
-- 已提供设置页与历史页骨架
-- 已提供 Rust `invoke` 命令接口，用于返回预览解释和保存 Provider 配置
-- 当前 AI 返回仍为原型数据，尚未接入真实模型调用、系统快捷键、选区读取和悬浮独立窗口
+- 桌面框架：Tauri 2
+- 宿主层：Rust
+- 前端：React 18 + TypeScript + Vite
+- AI 接入：OpenAI 兼容 Provider 抽象
+- 密钥存储：Windows Credential Manager / macOS Keychain（通过 keyring crate）
 
 ## 目录概览
 
@@ -32,58 +41,55 @@ Select2Explain 是一个面向 PC 场景的跨平台桌面应用，目标是在�
 Select2Explain/
 ├── docs/
 ├── src/
-│   ├── app/
-│   ├── components/
-│   ├── features/
-│   └── shared/
+│   ├── App.tsx
+│   ├── main.tsx
+│   └── styles.css
 ├── src-tauri/
+│   ├── capabilities/
+│   ├── icons/
 │   └── src/
+│       ├── commands/
+│       ├── platform/
+│       ├── providers/
+│       ├── services/
+│       └── state/
 └── package.json
 ```
 
 ## 本地开发前置条件
 
-启动前请先安装：
-
 - Node.js 20+
 - npm 10+
 - Rust stable toolchain
-- Cargo
+- Windows 上建议已安装 WebView2 Runtime
 
-当前这台机器缺少 `node`、`npm` 和 `cargo`，因此本次只完成了代码落地，未能实际安装依赖与运行构建。
-
-## 启动方式
+## 常用命令
 
 ```bash
 npm install
+npm run build
+cd src-tauri && cargo check
 npm run tauri:dev
 ```
 
-如果只需要查看前端界面，也可以使用：
+如果 `cargo` 访问官方 registry 较慢，可以在 Windows 上改用 rsproxy：
 
 ```bash
-npm install
-npm run dev
+cd src-tauri
+cargo --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" check
 ```
 
-## 当前推荐技术路线
+## 本轮已验证
 
-- 桌面框架：Tauri 2
-- 后端宿主：Rust
-- 前端界面：React + TypeScript + Vite
-- 本地存储：SQLite
-- AI 接入：兼容 OpenAI 风格接口，优先抽象成 Provider 层
-- 全局能力：系统快捷键、剪贴板监听、悬浮窗、权限引导、可选 OCR
-
-## 为什么不是传统 Electron 优先
-
-对于这类常驻后台、需要低资源占用、需要系统级窗口控制和权限集成的桌面工具，Tauri 在安装体积、内存占用和原生能力扩展方面更合适。Electron 仍然可行，但更适合作为备选方案而不是首选。
+- `npm run build`
+- `cargo check`（使用 rsproxy）
+- OpenRouter 实际 key 的连通性
+- Windows 前景窗口、鼠标坐标、UI Automation 文本采集、截图能力
+- release 启动会正确加载本地设置与日志开关
+- 当前 Windows 选区读取在记事本、VS Code 这类常见应用里仍有兼容性缺口
 
 ## 下一步
 
-接下来的实现优先级建议如下：
-
-1. 接入真实 AI Provider 和安全存储 API Key
-2. 实现全局快捷键和选中文本读取主链路
-3. 把解释预览从主窗口迁移到独立悬浮窗
-4. 增加 SQLite 持久化与真实历史记录
+1. 继续验证和优化原生 Windows 采集覆盖率，重点处理 VS Code、记事本这类宿主里的 UI Automation 兼容性缺口。
+2. 为 popup 增加复制、固定和重新解释操作。
+3. 为 macOS 补齐与 Windows 一致的后台监听和 popup 交互，再做单独验收。

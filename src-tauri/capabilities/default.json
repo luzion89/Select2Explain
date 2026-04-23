@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default-capability",
+  "description": "Default local capability for the settings window, popup window, tray actions and custom commands.",
+  "windows": [
+    "main",
+    "popup"
+  ],
+  "permissions": [
+    "core:default",
+    "shell:default"
+  ]
+}

@@ -1,1 +1,1 @@
-{}
+{"default-capability":{"identifier":"default-capability","description":"Default local capability for the settings window, popup window, tray actions and custom commands.","local":true,"windows":["main","popup"],"permissions":["core:default","shell:default"]}}

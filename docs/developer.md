@@ -1,95 +1,113 @@
 # Select2Explain 开发者文档
 
-## 技术栈
+## 当前技术栈
 
-- **框架**: Tauri 2.x + React 18 + TypeScript 5 + Vite 5
-- **Rust crates**: `tauri`, `tauri-plugin-shell`, `reqwest` (rustls-tls), `tokio`, `serde_json`, `anyhow`, `keyring 2.3.3`, `base64`
-- **平台**: macOS（Accessibility API via osascript）
-
----
+- 桌面宿主：Tauri 2.x
+- 前端：React 18 + TypeScript 5 + Vite 5
+- Rust crates：`tauri`、`tauri-plugin-shell`、`reqwest`、`tokio`、`serde_json`、`anyhow`、`keyring`、`base64`、`dirs`
+- 当前实现平台：Windows
 
 ## 项目结构
 
-```
+```text
 Select2Explain/
-├── src/                    # React 前端
-│   ├── App.tsx             # 主组件（Settings + Monitor 视图）
+├── src/
+│   ├── App.tsx             # 主控制面板 + popup 窗口入口
 │   ├── main.tsx            # React 入口
-│   └── styles.css          # 暗色主题样式
+│   └── styles.css          # 主窗口与 popup 样式
 ├── src-tauri/
+│   ├── capabilities/
+│   │   └── default.json    # main / popup 权限声明
+│   ├── icons/
 │   └── src/
-│       ├── main.rs         # Tauri 入口 + 后台轮询任务
-│       ├── commands/       # Tauri 命令（IPC 层）
-│       ├── state/          # 共享状态类型
-│       ├── platform/       # macOS Accessibility 封装
-│       ├── providers/      # AI API 客户端（OpenAI 兼容）
-│       └── services/
-│           ├── screenshot.rs   # screencapture 封装
-│           └── ai_pipeline.rs  # 两阶段 AI 流水线
-└── docs/                   # 文档
+│       ├── commands/       # Tauri IPC 命令
+│       ├── platform/       # Windows 采集 + macOS 设计路径
+│       ├── providers/      # OpenAI 兼容 Provider
+│       ├── services/       # AI pipeline / screenshot
+│       ├── state/          # 共享状态与 payload
+│       └── main.rs         # tray、popup、后台监听入口
+└── docs/
 ```
 
----
+## 当前实现重点
 
-## 架构说明
+### 1. 后台监听
 
-### 选中文字检测
+- `main.rs` 中的 `selection_monitor` 每 650ms 轮询一次 `platform::poll_selection()`。
+- 只有在 `translation_enabled` 为 `true` 时才会处理新的选区。
+- `RuntimeState` 用于防止重复触发与并发请求堆积。
 
-`main.rs` 中通过 `tauri::async_runtime::spawn` 启动后台任务 `selection_monitor`，每 600ms 调用一次 `platform::get_selected_text()`。
+### 2. Windows 平台采集
 
-`platform/mod.rs` 使用 osascript 读取前台应用的 `AXFocusedUIElement` 上的 `AXSelectedText` 属性。若检测到文字变化，向所有窗口 emit `"selection-changed"` 事件。
+- `platform/windows.rs` 使用 Rust 进程内的 Win32 API + UI Automation + GDI 原生实现。
+- 通过 Win32 + UI Automation + GDI 采集：
+   - 前台应用名
+   - 窗口标题
+   - 鼠标坐标
+   - 选中文本
+   - 窗口全文摘要
+   - 窗口截图
+- 采集模式分成 `probe` 和 `full`，以降低后台轮询成本。
+- 当某个前台窗口没有可访问选区时，会把“空选区”诊断写入本地日志，避免 release 形态下静默失败。
 
-> 注意：`AXSelectedText` 需从 `AXFocusedUIElement`（焦点 UI 元素）读取，而非从 `front window`。绝大多数应用只在聚焦的文本元素上暴露该属性。
+### 2.1 macOS 平台采集
 
-osascript 内置了自身进程过滤（`if name of frontApp is "select2explain" then return ""`），避免应用自己触发自己。
+- `platform/macos.rs` 现在也实现了 `poll_selection()` 和 `capture_context()`。
+- 通过 Accessibility 读取 `AXSelectedText`。
+- 通过 `System Events` 获取前台应用和窗口标题。
+- 通过 JXA + AppKit 获取鼠标坐标。
+- 通过 `services/screenshot.rs` 的 `screencapture` 路径生成截图。
+- 这部分代码尚未在本轮环境做编译或真机测试。
 
-### 两阶段 AI 流水线（`ai_pipeline.rs`）
+### 3. AI 管线
 
-1. **Stage 1 - 视觉判断**: 截取当前窗口截图，发给视觉模型，判断截图上下文是否足以理解选中文字的含义
-2. **Stage 2 - 文本解释**:
-   - 若截图充分 + 有窗口文字 → 文本模型 + 上下文
-   - 若截图充分 + 无窗口文字 → 视觉模型直接解释
-   - 若截图不充分 → 文本模型 + 完整窗口文字
+`services/ai_pipeline.rs` 负责渐进式上下文策略：
 
-### API 密钥存储
+1. 先把选区和截图发给视觉模型，判断截图是否足够理解语境。
+2. 若足够且有窗口全文，则转给文本模型生成解释。
+3. 若不足，则补发窗口全文。
 
-使用 macOS Keychain（`keyring` crate），服务名 `com.tuntun.select2explain`，用户名 `api_key`。
+### 4. popup 窗口
 
----
+- popup 由 Rust 在运行时创建，不写在 `tauri.conf.json` 中。
+- 前端 popup 收到 `popup:show` 后会根据鼠标坐标和当前屏幕边界重新定位。
+- popup 监听 `WINDOW_BLUR`，失焦即隐藏。
+
+### 5. 设置与日志
+
+- `services/settings_store.rs` 会把 Provider 配置、监听开关和调试日志开关落到本地 `settings.json`。
+- `services/debug_log.rs` 会把运行时 probe / capture / AI pipeline / popup 事件写入本地 `runtime.log`。
+- 这些文件默认位于系统本地应用数据目录下的 `Select2Explain` 目录。
+
+## Tauri 命令
+
+| 命令 | 参数 | 返回 | 用途 |
+|---|---|---|---|
+| `get_settings` | - | `{ baseUrl, model, visionModel, translationEnabled, debugLoggingEnabled, apiKeyConfigured, debugLogPath }` | 读取当前设置 |
+| `save_settings` | `settings` | `()` | 保存 Base URL / 模型 / 自动监听开关 / 日志开关 |
+| `save_api_key` | `key` | `()` | 保存 API Key |
+| `delete_api_key` | - | `()` | 删除 API Key |
+| `test_connection` | - | `u64` | 验证 Provider 连通性 |
+| `explain_selection` | `selectedText` | `ExplainResponse` | 手动执行解释 |
+| `debug_probe_selection` | - | `SelectionProbe | null` | 调试当前选区探测 |
+| `debug_capture_context` | - | `{ available, snapshot }` | 调试完整上下文采集 |
 
 ## 开发命令
 
 ```bash
-# 启动开发模式（热重载）
+npm install
+npm run build
+
+cd src-tauri
+cargo --config "source.crates-io.replace-with='rsproxy'" --config "source.rsproxy.registry='sparse+https://rsproxy.cn/index/'" check
+
+cd ..
 npm run tauri:dev
-
-# TypeScript 类型检查
-npx tsc --noEmit
-
-# Rust 检查（不链接）
-cd src-tauri && cargo check
-
-# 生产构建
-npm run tauri:build
 ```
 
----
+## 当前已知限制
 
-## Tauri 命令列表
-
-| 命令 | 参数 | 返回 | 说明 |
-|------|------|------|------|
-| `get_settings` | - | `{ baseUrl, model, visionModel, apiKeyConfigured }` | 读取当前配置 |
-| `save_settings` | `settings: ProviderSettings` | `()` | 保存 Provider 配置 |
-| `save_api_key` | `key: String` | `()` | 写入 Keychain |
-| `delete_api_key` | - | `()` | 清除 Keychain 中的 Key |
-| `explain_selection` | `selectedText: String` | `ExplainResponse` | 运行两阶段 AI 解释 |
-| `test_connection` | - | `u64` (latency_ms) | 验证 API Key 和连接性 |
-
----
-
-## 已知限制
-
-- 仅支持 macOS（Accessibility API 依赖 osascript）
-- 沙盒严格的 App Store 应用可能不暴露 `AXSelectedText`
-- 截图使用 `screencapture -x -o -m`，需屏幕录制权限（macOS 10.15+）
+- Windows 采集已改为原生 Win32/UI Automation 路径，但不同宿主应用的 UI Automation 暴露能力仍有兼容性差异。
+- 当前 Windows 选区读取对常见应用的兼容性不足；本轮复测中，记事本和 VS Code 都没有通过 UI Automation 暴露可用选区，因此会出现“监听已开但没有 popup”的现象。
+- `debug_capture_context` 当前会返回完整截图 base64，适合调试，但不适合长期作为常规接口暴露。
+- macOS 已补齐代码路径，但没有在本轮做实际验收。

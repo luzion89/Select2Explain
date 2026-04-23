@@ -42,13 +42,59 @@ impl OpenAiProvider {
             max_tokens: 1024,
             temperature: 0.3,
         };
+        let request_body = serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"failed to serialize request body\"}".to_string());
+        crate::services::debug_log::trace(
+            "provider-text",
+            format!(
+                "request: url={}, model={}, system={}, user={}",
+                url,
+                body.model,
+                crate::services::debug_log::truncate_for_log(&body.messages[0].content, 180),
+                crate::services::debug_log::truncate_for_log(&body.messages[1].content, 420),
+            ),
+        );
+        crate::services::debug_log::http(
+            "provider-text",
+            format!("request: method=POST, url={}, body={}", url, request_body),
+        );
         let http_resp = self.client.post(&url)
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send().await.context("request failed")?;
+            .send().await;
+        let http_resp = match http_resp {
+            Ok(response) => response,
+            Err(error) => {
+                crate::services::debug_log::http(
+                    "provider-text",
+                    format!("response: error=request failed, latency_ms={}, detail={error}", start.elapsed().as_millis()),
+                );
+                return Err(error).context("request failed");
+            }
+        };
         let status = http_resp.status();
-        let raw = http_resp.text().await.context("read response body failed")?;
+        let raw = match http_resp.text().await {
+            Ok(raw) => raw,
+            Err(error) => {
+                crate::services::debug_log::http(
+                    "provider-text",
+                    format!("response: error=read response body failed, status={}, latency_ms={}, detail={error}", status.as_u16(), start.elapsed().as_millis()),
+                );
+                return Err(error).context("read response body failed");
+            }
+        };
+        crate::services::debug_log::http(
+            "provider-text",
+            format!("response: status={}, latency_ms={}, body={}", status.as_u16(), start.elapsed().as_millis(), raw),
+        );
         if !status.is_success() {
+            crate::services::debug_log::trace(
+                "provider-text",
+                format!(
+                    "response error: status={}, body={}",
+                    status.as_u16(),
+                    crate::services::debug_log::truncate_for_log(&raw, 420),
+                ),
+            );
             // Extract message from OpenAI-style error body if possible
             let msg = serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
@@ -57,10 +103,20 @@ impl OpenAiProvider {
             return Err(anyhow::anyhow!(msg));
         }
         let resp: Resp = serde_json::from_str(&raw).context("parse response failed")?;
+        let content = resp.choices.into_iter().next()
+            .map(|c| c.message.content)
+            .unwrap_or_default();
+        crate::services::debug_log::trace(
+            "provider-text",
+            format!(
+                "response ok: status={}, latency_ms={}, content={}",
+                status.as_u16(),
+                start.elapsed().as_millis(),
+                crate::services::debug_log::truncate_for_log(&content, 420),
+            ),
+        );
         Ok(ProviderResponse {
-            content: resp.choices.into_iter().next()
-                .map(|c| c.message.content)
-                .unwrap_or_default(),
+            content,
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }
@@ -86,6 +142,22 @@ impl OpenAiProvider {
             "max_tokens": 512,
             "temperature": 0.2
         });
+        let request_body = serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"failed to serialize vision request body\"}".to_string());
+        crate::services::debug_log::trace(
+            "provider-vision",
+            format!(
+                "request: url={}, model={}, user_text={}, image_mime={}, image_bytes={}",
+                url,
+                req.model,
+                crate::services::debug_log::truncate_for_log(&req.user_text, 320),
+                req.image_mime,
+                req.image_base64.len(),
+            ),
+        );
+        crate::services::debug_log::http(
+            "provider-vision",
+            format!("request: method=POST, url={}, body={}", url, request_body),
+        );
 
         #[derive(Deserialize)]
         struct Choice { message: MsgContent }
@@ -97,10 +169,41 @@ impl OpenAiProvider {
         let http_resp = self.client.post(&url)
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send().await.context("vision request failed")?;
+            .send().await;
+        let http_resp = match http_resp {
+            Ok(response) => response,
+            Err(error) => {
+                crate::services::debug_log::http(
+                    "provider-vision",
+                    format!("response: error=vision request failed, latency_ms={}, detail={error}", start.elapsed().as_millis()),
+                );
+                return Err(error).context("vision request failed");
+            }
+        };
         let status = http_resp.status();
-        let raw = http_resp.text().await.context("read vision response body failed")?;
+        let raw = match http_resp.text().await {
+            Ok(raw) => raw,
+            Err(error) => {
+                crate::services::debug_log::http(
+                    "provider-vision",
+                    format!("response: error=read vision response body failed, status={}, latency_ms={}, detail={error}", status.as_u16(), start.elapsed().as_millis()),
+                );
+                return Err(error).context("read vision response body failed");
+            }
+        };
+        crate::services::debug_log::http(
+            "provider-vision",
+            format!("response: status={}, latency_ms={}, body={}", status.as_u16(), start.elapsed().as_millis(), raw),
+        );
         if !status.is_success() {
+            crate::services::debug_log::trace(
+                "provider-vision",
+                format!(
+                    "response error: status={}, body={}",
+                    status.as_u16(),
+                    crate::services::debug_log::truncate_for_log(&raw, 420),
+                ),
+            );
             let msg = serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
@@ -108,11 +211,21 @@ impl OpenAiProvider {
             return Err(anyhow::anyhow!(msg));
         }
         let resp: Resp = serde_json::from_str(&raw).context("vision parse response failed")?;
+        let content = resp.choices.into_iter().next()
+            .map(|c| c.message.content)
+            .unwrap_or_default();
+        crate::services::debug_log::trace(
+            "provider-vision",
+            format!(
+                "response ok: status={}, latency_ms={}, content={}",
+                status.as_u16(),
+                start.elapsed().as_millis(),
+                crate::services::debug_log::truncate_for_log(&content, 420),
+            ),
+        );
 
         Ok(ProviderResponse {
-            content: resp.choices.into_iter().next()
-                .map(|c| c.message.content)
-                .unwrap_or_default(),
+            content,
             latency_ms: start.elapsed().as_millis() as u64,
         })
     }

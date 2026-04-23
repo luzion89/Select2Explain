@@ -1,6 +1,6 @@
-use tauri::State;
-use crate::state::{AppState, ExplainResponse, ProviderSettings, KEYRING_SERVICE, KEYRING_USER};
-use crate::services::{screenshot, ai_pipeline};
+use tauri::{AppHandle, State};
+use crate::state::{normalize_ai_wait_ms, AppState, ExplainResponse, ProviderSettings, KEYRING_SERVICE, KEYRING_USER};
+use crate::services::ai_pipeline;
 use crate::platform;
 
 fn load_api_key() -> Option<String> {
@@ -13,8 +13,25 @@ fn load_api_key() -> Option<String> {
 /// Called by frontend to save provider settings.
 #[tauri::command]
 pub fn save_settings(settings: ProviderSettings, state: State<'_, AppState>) -> Result<(), String> {
+    let normalized = ProviderSettings {
+        max_ai_wait_ms: normalize_ai_wait_ms(settings.max_ai_wait_ms),
+        ..settings
+    };
     let mut lock = state.settings.lock().map_err(|_| "lock error".to_string())?;
-    *lock = settings;
+    *lock = normalized.clone();
+    crate::services::settings_store::save_settings(&normalized)?;
+    crate::services::debug_log::set_enabled(normalized.debug_logging_enabled);
+    crate::services::debug_log::log(
+        "settings",
+        format!(
+            "settings saved: translation_enabled={}, debug_logging_enabled={}, max_ai_wait_ms={}, base_url={}, model={}",
+            normalized.translation_enabled,
+            normalized.debug_logging_enabled,
+            normalized.max_ai_wait_ms,
+            normalized.base_url,
+            normalized.model,
+        ),
+    );
     Ok(())
 }
 
@@ -44,13 +61,32 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
     Ok(serde_json::json!({
         "baseUrl": s.base_url,
         "model": s.model,
-        "visionModel": s.vision_model,
+        "translationEnabled": s.translation_enabled,
+        "debugLoggingEnabled": s.debug_logging_enabled,
         "apiKeyConfigured": configured,
+        "maxAiWaitMs": s.max_ai_wait_ms,
+        "debugLogPath": crate::services::debug_log::current_log_path(),
+        "interactionLogPath": crate::services::debug_log::current_interaction_log_path(),
+        "httpLogPath": crate::services::debug_log::current_http_log_path(),
     }))
 }
 
-/// Core command: take screenshot, run two-stage AI, return explanation.
-/// Frontend calls this when it detects selection has changed (via polling event).
+#[tauri::command]
+pub fn cancel_popup_request(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    crate::cancel_active_request(
+        &app,
+        reason.as_deref().unwrap_or("popup cancel requested by frontend"),
+        true,
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resize_popup_window(app: AppHandle, width: u32, height: u32) -> Result<(), String> {
+    crate::resize_popup_window(&app, width, height)
+}
+
+/// Core command: capture current window text context, run text-only AI explanation, return result.
 #[tauri::command]
 pub async fn explain_selection(
     selected_text: String,
@@ -61,21 +97,28 @@ pub async fn explain_selection(
         .clone();
 
     let api_key = load_api_key().ok_or("API key not configured")?;
-    let source_app = platform::active_app_name();
+    let snapshot = tokio::task::spawn_blocking(platform::capture_context)
+        .await
+        .map_err(|e| format!("capture join failed: {e}"))?
+        .map_err(|e| format!("capture failed: {e}"))?;
 
-    // Capture screenshot
-    let (screenshot_b64, screenshot_mime) = screenshot::capture_frontmost_window()
-        .map_err(|e| format!("screenshot failed: {e}"))?;
+    let source_app = snapshot.as_ref()
+        .map(|item| item.source_app.clone())
+        .unwrap_or_else(platform::active_app_name);
 
-    // Get window text (best-effort, may be empty)
-    let window_text = platform::get_window_text().unwrap_or_default();
+    let selected_text = snapshot.as_ref()
+        .map(|item| item.selected_text.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(selected_text);
+
+    let window_text = snapshot
+        .map(|item| item.window_text)
+        .unwrap_or_default();
 
     let result = ai_pipeline::run(
         ai_pipeline::PipelineInput {
             selected_text: selected_text.clone(),
             window_text,
-            screenshot_b64,
-            screenshot_mime,
         },
         &settings,
         &api_key,

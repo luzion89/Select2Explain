@@ -1,262 +1,153 @@
-# Select2Explain 技术架构与选型
+# Select2Explain 技术架构
 
-## 1. 总体结论
+## 1. 总体结构
 
-推荐使用以下技术组合：
+当前实现采用 Tauri 2 + Rust + React + TypeScript。主窗口负责配置，popup 窗口负责展示解释；托盘提供后台常驻入口；Rust 负责跨应用采集、AI 请求编排、系统热键和窗口事件分发。
 
-- 桌面应用框架：Tauri 2
-- 原生宿主层：Rust
-- 前端 UI：React + TypeScript + Vite
-- 数据层：SQLite + `sqlx` 或 `rusqlite`
-- 配置与密钥存储：系统钥匙串 + 本地配置文件
-- AI 访问层：Provider 抽象，兼容 OpenAI 风格接口
+## 2. 核心流程
 
-这套方案的核心目标是兼顾跨平台、系统集成能力、安装体积、性能和后续扩展性。
+### 2.1 后台监听主链路
 
-## 2. 技术选型比较
+1. `main.rs` 在 `setup` 阶段创建主窗口、popup 窗口和 tray。
+2. `selection_monitor` 后台任务在 Windows 上会持续观察鼠标左键状态，只在一次按下后松开并经过短暂稳定延迟后，才调用平台层的 `poll_selection()` 做一次选区探测；其他平台暂时仍保留轮询兜底。
+3. 若监听开关关闭，直接跳过并清空上次选区签名。
+4. 若拿到新的选区签名，并且不是本应用窗口，则进入处理流程。
+5. 处理流程调用 `capture_context()` 获取当前选区、窗口文本和窗口元信息。
+6. `services/ai_pipeline.rs` 直接将“选区 + 当前窗口全文”送入 text-only 管线，请求一次 AI 解释。
+7. loading 阶段后端只显示 popup，不主动抢占前台窗口焦点，避免污染当前宿主窗口的全文采集。
+8. AI 返回结果后，后端再把 popup 切到可交互状态并聚焦，随后 emit `PopupPayload` 给 popup 窗口。
+9. 前端 popup 根据鼠标坐标重新定位、按内容重新计算窗口高度，并在失焦时隐藏；后端也会轮询做一次失焦隐藏兜底。
 
-### 2.1 Tauri vs Electron
+### 2.3 系统热键
 
-#### 选择 Tauri 的原因
+- 当前注册全局热键 `Ctrl + Alt + Q`。
+- 热键会直接切换 `translation_enabled`，并立即持久化到本地设置。
+- 控制面板打开时会接收 `settings:changed` 事件，保持 UI 与热键状态一致。
 
-- 更小的安装包和更低的常驻资源占用，适合后台驻留型工具
-- Rust 宿主层更适合处理系统权限、窗口管理、原生事件与安全边界
-- 做悬浮窗、托盘、全局快捷键、剪贴板等系统能力时更容易控制细节
+### 2.2 去重策略
 
-#### Electron 的优点
+- `state::RuntimeState` 记录 `last_selection_signature` 和 `in_flight`。
+- 同一签名的选区不会重复请求。
+- 没有选区时会清空签名，保证用户再次选中相同内容仍然可以触发。
 
-- 生态成熟
-- 前端团队上手成本更低
-- 三方桌面能力库较多
+## 3. 模块划分
 
-#### 为什么当前不优先 Electron
+### 3.1 前端
 
-本项目不是重前端页面的文档类桌面产品，而是轻 UI、强系统交互的常驻工具。资源占用与系统融合优先级更高，因此 Tauri 更合适。
+- `src/App.tsx`
+	- `main` 窗口：控制面板、Provider 设置、Key 管理、连接测试、日志开关。
+	- `popup` 窗口：解释卡片、错误展示、鼠标邻近定位、失焦自动隐藏。
+- `src/styles.css`
+	- 主控制面板和 popup 的统一视觉语言。
 
-### 2.2 React vs Vue / Svelte
+### 3.2 后端
 
-选择 React + TypeScript，原因如下：
+- `src-tauri/src/main.rs`
+	- tray、popup、窗口关闭转隐藏、后台监听、系统热键和 popup 事件分发。
+- `src-tauri/src/commands/mod.rs`
+	- 设置读取/保存、API Key 存储、手动连接测试。
+- `src-tauri/src/platform/mod.rs`
+	- 平台无关数据结构和分发入口。
+- `src-tauri/src/platform/windows.rs`
+	- Windows 采集实现。
+- `src-tauri/src/services/ai_pipeline.rs`
+	- 单阶段 text-only AI 管线。
+- `src-tauri/src/providers/openai.rs`
+	- OpenAI 兼容 HTTP 客户端。
+- `src-tauri/src/state/mod.rs`
+	- `ProviderSettings`、`RuntimeState`、`PopupPayload` 等共享类型。
 
-- 生态成熟，适合搭建设置页、历史面板、悬浮解释窗等多视图界面
-- 与 Tauri 社区示例和前端工具链兼容良好
-- 后续若引入状态机、富文本渲染、流式输出组件，生态更完整
+## 4. Windows 实现细节
 
-### 2.3 SQLite vs 纯文件存储
+### 4.1 为什么改为原生 WinAPI + UI Automation
 
-历史记录、Prompt 模板、Provider 配置、调试日志等都适合结构化存储。SQLite 比 JSON 文件更利于后续检索、清理和迁移。
+Windows 采集路径已经不再依赖 PowerShell 子进程，也不再通过运行时拼装脚本调用 `pwsh -NoProfile -STA -Command`。当前实现直接在 Rust 进程内调用 Win32 API 和 UI Automation 完成探测与上下文采集。
 
-## 3. 架构分层
+这个方案的主要收益：
 
-建议采用四层结构：
+- 不再额外拉起 PowerShell 前台进程，降低焦点扰动和轮询抖动。
+- probe 阶段不再使用剪贴板 `Ctrl+C` 兜底，避免某些编辑器在“无选区时复制当前行”而引发循环弹窗。
+- 鼠标释放、窗口元信息和选区读取都在同一进程内完成，超时、日志和错误边界更清晰。
+- 彻底绕开脚本扫描与 PowerShell 执行策略带来的额外不确定性。
 
-### 3.1 Presentation Layer
+### 4.2 Windows 采集内容
 
-职责：
+`platform/windows.rs` 当前会收集：
 
-- 悬浮解释窗
-- 设置页
-- 历史记录页
-- 权限引导页
+- 前台窗口标题与进程名
+- 当前鼠标屏幕坐标
+- 当前窗口矩形区域
+- UI Automation 选区文本
+- 窗口全文摘要
 
-建议：
+采集分为两个模式：
 
-- React 组件只处理展示与交互状态
-- 复杂业务流程交给应用服务层
+- `probe`：只取选区与窗口元信息；默认发生在鼠标左键释放后的轻量探测阶段，只走无副作用的 UI Automation 读取，不触发剪贴板兜底。
+- `full`：补取窗口全文；必要时才允许走原生剪贴板兜底，供 AI 请求前的完整上下文采集使用。
 
-### 3.2 Application Layer
+## 5. popup 与窗口管理
 
-职责：
+### 5.1 popup 窗口属性
 
-- 解释请求编排
-- Prompt 构造
-- Provider 路由
-- 错误处理与重试策略
-- 历史记录写入
+- 无边框
+- 透明宿主窗口
+- 置顶
+- 跳过任务栏
+- 默认隐藏
+- 由后端在运行时创建，不写死在 `tauri.conf.json`
+- 内容由前端绘制为圆角卡片，不保留可见标题条或拖拽条
 
-### 3.3 Domain Layer
+### 5.2 popup 定位策略
 
-核心领域对象建议包括：
+- 前端根据后端传回的鼠标物理坐标调用 `monitorFromPoint()`。
+- 结合当前 popup 尺寸和当前屏幕 `workArea` 做边界裁剪。
+- 优先出现在鼠标右上方；上方空间不足时，退回到鼠标下方。
+- popup 高度不再固定，前端会按卡片内容重新测量窗口高度；若内容过长，则在屏幕工作区允许的最大高度内增长，并由解释区自行滚动。
 
-- `SelectionPayload`
-- `ContextSnapshot`
-- `ExplainRequest`
-- `ExplainResult`
-- `PromptTemplate`
-- `ProviderConfig`
+### 5.3 隐藏策略
 
-### 3.4 Infrastructure Layer
+- popup 在显示后会显式聚焦，并监听 `WINDOW_BLUR`；点击其他位置时会自动隐藏。
+- 若前端 `WINDOW_BLUR` 事件缺失，后端仍会在监听循环中检查“popup 已显示且失焦”的状态，并主动隐藏窗口。
+- 主窗口关闭时不销毁，只转为隐藏，保证后台监听和 tray 继续运行。
 
-职责：
+## 6. 配置与安全
 
-- Tauri 原生能力封装
-- 剪贴板与快捷键
-- 鼠标位置与窗口定位
-- SQLite 读写
-- Keychain / Credential Manager
-- HTTP 请求封装
+- Provider 设置通过 `services/settings_store.rs` 落到本地 `settings.json`，前端通过 `get_settings` / `save_settings` 读写。
+- API Key 使用 `keyring` crate 写入系统安全存储。
+- 默认 Base URL 为 `https://openrouter.ai/api/v1`。
+- 默认文本模型为 `google/gemini-2.5-flash-lite`。
+- 调试日志写入本地 `runtime.log`，路径位于系统本地应用数据目录下的 `Select2Explain` 目录。
 
-## 4. 核心模块设计
+### 6.1 构建缓存与脚本
 
-### 4.1 选区获取模块
+- 仓库根 `.cargo/config.toml` 已固定 `target-dir` 到 `src-tauri/target`，避免每轮构建重新生成新的目标目录。
+- `npm run tauri:build` 现在走 `tauri build --no-bundle`，只产出 release 可执行文件，不再在日常验证时触发 WiX/NSIS 安装器下载。
+- 仅当需要安装包时再执行 `npm run tauri:bundle`。
 
-MVP 采用可靠性优先策略：
+## 7. 调试能力
 
-- 主路径：用户先选中文本，再按快捷键触发
-- 实现路径：触发时优先尝试读取系统可获取的选中内容
-- Fallback：若失败，则通过受控剪贴板流程获取文本
+当前调试入口以本地日志为主：
 
-建议模块接口：
+- `runtime.log`：监听状态、popup 显示/隐藏与概要错误。
+- `interaction.log`：更细的采集、AI 请求与 provider 返回轨迹。
 
-- `capture_selection()`
-- `capture_context()`
-- `get_active_app_info()`
+## 8. macOS 代码路径
 
-### 4.2 上下文组装模块
+当前已经补出独立的 `platform/macos.rs`，并与 Windows 共用同一套 `poll_selection()` / `capture_context()` 接口。macOS 路径目前包含：
 
-输入来源：
+1. 通过 Accessibility 读取 `AXSelectedText`。
+2. 通过 `System Events` 读取前台应用名与窗口标题。
+3. 通过 JXA + AppKit 读取鼠标坐标。
+4. 通过 `screencapture` 获取截图。
+5. 通过本地日志记录 probe / capture 成功与失败信息。
 
-- 选中文本
-- 活动应用名
-- 窗口标题
-- 用户配置的解释风格
-- 可选模板
+这部分已经完成代码实现和接口对齐，但由于当前开发机不是 macOS，本轮没有做实际编译与运行验收。
 
-输出：
+## 9. 下一步技术方向
 
-- 标准化 Prompt 请求体
-
-要求：
-
-- 对不同场景使用不同模板，例如阅读、代码、商务沟通
-- 控制 token 长度，避免无边界扩张
-
-### 4.3 AI Provider 模块
-
-统一抽象：
-
-- `ProviderAdapter`
-- `ModelDescriptor`
-- `CompletionRequest`
-- `CompletionResponse`
-
-首版建议支持：
-
-- OpenAI 兼容接口
-- DeepSeek 兼容接口
-- 自定义 Base URL
-
-这样后续切换模型时不需要修改上层业务。
-
-### 4.4 弹窗与窗口管理模块
-
-需要支持：
-
-- 鼠标当前位置计算
-- 多屏坐标换算
-- DPI 缩放适配
-- 避免超出屏幕边界
-- 临时窗和固定窗两种模式
-
-关键点：
-
-- 默认使用无边框、置顶、非任务栏窗口
-- 需要精细处理焦点行为，避免弹窗抢走用户当前输入焦点
-
-### 4.5 配置与安全模块
-
-建议区分：
-
-- 普通配置：本地文件保存
-- 敏感信息：系统安全存储
-
-macOS 使用 Keychain，Windows 使用 Credential Manager。
-
-## 5. 跨平台关键能力清单
-
-### 5.1 macOS
-
-- 全局快捷键
-- 剪贴板访问
-- Accessibility 权限引导
-- 悬浮窗置顶与位置控制
-- 托盘常驻
-
-### 5.2 Windows
-
-- 全局快捷键
-- 剪贴板访问
-- 活动窗口信息获取
-- 悬浮窗置顶与透明边框控制
-- 托盘常驻
-
-### 5.3 权限策略
-
-必须把权限处理当作产品功能而不是纯技术细节。首启建议做引导式检查：
-
-1. 检查快捷键能力是否可用
-2. 检查剪贴板访问是否正常
-3. 在 macOS 上检测 Accessibility 授权状态
-4. 权限缺失时提供明确操作说明和重试按钮
-
-## 6. 数据模型建议
-
-### 6.1 explain_history
-
-- `id`
-- `selected_text`
-- `context_summary`
-- `prompt_template_id`
-- `provider_name`
-- `model_name`
-- `response_text`
-- `latency_ms`
-- `source_app`
-- `created_at`
-
-### 6.2 provider_config
-
-- `id`
-- `provider_type`
-- `base_url`
-- `model_name`
-- `is_default`
-- `created_at`
-
-### 6.3 prompt_template
-
-- `id`
-- `name`
-- `scene`
-- `system_prompt`
-- `user_prompt_pattern`
-- `is_builtin`
-
-## 7. Prompt 策略
-
-建议从一开始就把 Prompt 模板化，而不是把文案硬编码在业务里。
-
-基础模板至少分三类：
-
-- 通用阅读解释
-- 代码/技术解释
-- 商务或自然语言沟通解释
-
-每类模板都要包含：
-
-- 解释目标
-- 输出格式约束
-- 语气控制
-- 是否输出歧义项
-
-## 8. 可观测性与调试
-
-首版就建议加入最小可观测能力：
-
-- 请求耗时
-- Provider 错误码
-- 选区获取失败原因
-- 权限缺失状态
-- 用户是否使用 fallback 流程
+1. 继续优化原生 Windows 采集，重点验证更多宿主应用下的 UI Automation 覆盖率。
+2. 补充 popup 内的复制、固定和重试动作。
+3. 为 macOS 做单独验收，重点验证鼠标坐标换算、权限引导和 popup 定位。
 
 这些信息应写入本地日志，便于快速排查跨平台问题。
 
